@@ -392,6 +392,18 @@ def plot_heatmap_diag_unidade(df):
     return fig
 
 # ============================================================================
+# FUNÇÕES AUXILIARES
+# ============================================================================
+
+def display_logo():
+    """Exibe o logo no topo da sidebar."""
+    try:
+        st.sidebar.image("Logo Clinica Pace (1) (1).png", use_container_width=True)
+        st.sidebar.markdown("---")
+    except:
+        pass  # Se o logo não for encontrado, continua sem ele
+
+# ============================================================================
 # INTERFACE PRINCIPAL
 # ============================================================================
 
@@ -1171,6 +1183,9 @@ def page_avaliacoes():
     )
 
 def main_app():
+    # Logo no topo da sidebar (aparece em todas as páginas)
+    display_logo()
+    
     # Menu de navegação
     page = st.sidebar.selectbox(
         "📑 Navegação",
