@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import os
+import re
+from typing import Optional
 from datetime import datetime, date
 import warnings
 warnings.filterwarnings('ignore')
@@ -402,6 +405,313 @@ def display_logo():
         st.sidebar.markdown("---")
     except:
         pass  # Se o logo não for encontrado, continua sem ele
+
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="latin-1") as f:
+            return f.read()
+
+def _get_openai_api_key() -> Optional[str]:
+    # Preferir secrets no Streamlit Cloud, mas permitir env/local também.
+    try:
+        key = st.secrets.get("OPENAI_API_KEY")
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+def _build_insights_data_context(df_filtrado: pd.DataFrame, periodo_label: str) -> str:
+    # Mantém o contexto curto para caber no prompt
+    total_atendimentos = len(df_filtrado)
+    pacientes_unicos = int(df_filtrado["paciente_id"].nunique()) if "paciente_id" in df_filtrado.columns else 0
+    diagnosticos_distintos = int(df_filtrado["diagnostico_vigente"].nunique()) if "diagnostico_vigente" in df_filtrado.columns else 0
+    sem_diag_count = int((df_filtrado["diagnostico_vigente"] == "SEM DIAGNÓSTICO").sum()) if "diagnostico_vigente" in df_filtrado.columns else 0
+    pct_sem_diag = (sem_diag_count / total_atendimentos * 100) if total_atendimentos > 0 else 0.0
+
+    ctx = []
+    ctx.append(f"### Período / recorte\n{periodo_label}\n")
+    ctx.append("### KPIs do recorte")
+    ctx.append(f"- Total de atendimentos: {total_atendimentos}")
+    ctx.append(f"- Pacientes únicos: {pacientes_unicos}")
+    ctx.append(f"- Diagnósticos distintos: {diagnosticos_distintos}")
+    ctx.append(f"- Atendimentos 'SEM DIAGNÓSTICO': {sem_diag_count} ({pct_sem_diag:.2f}%)\n")
+
+    # Top diagnósticos / unidades / profissionais
+    def _df_to_md_table(df_in: pd.DataFrame) -> str:
+        if df_in is None or df_in.empty:
+            return "_Sem dados para este recorte._"
+        cols = list(df_in.columns)
+        header = "| " + " | ".join(cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        rows = []
+        for _, row in df_in.iterrows():
+            rows.append("| " + " | ".join(str(row[c]) for c in cols) + " |")
+        return "\n".join([header, sep] + rows)
+
+    def _top_table(series: pd.Series, top_n: int = 10) -> str:
+        if series is None or series.empty:
+            return "_Sem dados para este recorte._"
+        top = series.value_counts().head(top_n).reset_index()
+        top.columns = ["categoria", "qtde"]
+        return _df_to_md_table(top)
+
+    if "diagnostico_vigente" in df_filtrado.columns:
+        ctx.append("### Top 10 diagnósticos (qtde atendimentos)")
+        ctx.append(_top_table(df_filtrado["diagnostico_vigente"]))
+        ctx.append("")
+    if "unidade" in df_filtrado.columns:
+        ctx.append("### Top 10 unidades (qtde atendimentos)")
+        ctx.append(_top_table(df_filtrado["unidade"]))
+        ctx.append("")
+    if "profissional_atendimento" in df_filtrado.columns:
+        ctx.append("### Top 10 profissionais (qtde atendimentos)")
+        ctx.append(_top_table(df_filtrado["profissional_atendimento"]))
+        ctx.append("")
+
+    # Série temporal mensal (últimos 12 meses do recorte)
+    if "data_atendimento" in df_filtrado.columns and pd.api.types.is_datetime64_any_dtype(df_filtrado["data_atendimento"]):
+        df_ts = df_filtrado.copy()
+        df_ts["ano_mes"] = df_ts["data_atendimento"].dt.to_period("M").astype(str)
+        ts = df_ts.groupby("ano_mes").size().reset_index(name="n_atendimentos").sort_values("ano_mes")
+        ts = ts.tail(12)
+        if not ts.empty:
+            ctx.append("### Série temporal mensal (últimos 12 meses no recorte)")
+            ctx.append(_df_to_md_table(ts))
+            ctx.append("")
+
+    # Qualidade mínima
+    cols = [c for c in ["atendimento_id", "paciente_id", "data_atendimento", "profissional_atendimento", "unidade", "diagnostico_vigente", "data_avaliacao_origem", "profissional_avaliacao_origem"] if c in df_filtrado.columns]
+    ctx.append("### Colunas disponíveis (no recorte)")
+    ctx.append(", ".join(cols) if cols else "_Colunas não identificadas._")
+
+    return "\n".join(ctx)
+
+def _generate_insights_with_ai(prompt_template: str, data_context_md: str, api_key: str, model: str, temperature: float) -> str:
+    # Import dentro da função para evitar erro local se a lib não estiver instalada ainda.
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    messages = [
+        {"role": "system", "content": prompt_template},
+        {"role": "user", "content": f"## DADOS PARA ANÁLISE\n\n{data_context_md}\n\nGere o relatório no formato especificado no prompt. Não invente dados."},
+    ]
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=messages,
+    )
+    return resp.choices[0].message.content or ""
+
+def _markdown_to_safe_text(md: str) -> str:
+    # Remove blocos de código
+    text = re.sub(r"```[\\s\\S]*?```", "", md)
+    # Remove links mantendo o texto
+    text = re.sub(r"\\[([^\\]]+)\\]\\([^\\)]+\\)", r"\\1", text)
+    # Remove marcações comuns
+    text = re.sub(r"^#{1,6}\\s*", "", text, flags=re.MULTILINE)
+    text = text.replace("**", "").replace("__", "")
+    text = text.replace("`", "")
+    # Remove emojis / chars fora do latin-1 (FPDF core fonts)
+    text = text.encode("latin-1", "replace").decode("latin-1")
+    return text.strip()
+
+def _report_md_to_pdf_bytes(title: str, report_md: str) -> bytes:
+    from fpdf import FPDF
+
+    def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+        s = hex_color.lstrip("#")
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+
+    primary_rgb = _hex_to_rgb(COLORS.get("primary", "#00A9A1"))
+    border_rgb = _hex_to_rgb(COLORS.get("border", "#E5E7EB"))
+    bg_rgb = _hex_to_rgb(COLORS.get("primary_tint", "#E6F6F6"))
+
+    safe_title = _markdown_to_safe_text(title)
+    safe_md = report_md.encode("latin-1", "replace").decode("latin-1")
+
+    class PDF(FPDF):
+        def header(self):  # noqa: N802
+            # Logo pequeno + título no topo
+            try:
+                if os.path.exists("Logo Clinica Pace (1) (1).png"):
+                    self.image("Logo Clinica Pace (1) (1).png", x=10, y=8, w=18)
+            except Exception:
+                pass
+
+            self.set_draw_color(*border_rgb)
+            self.set_text_color(*primary_rgb)
+            self.set_font("Helvetica", "B", 11)
+            self.set_xy(32, 10)
+            self.cell(0, 6, safe_title, ln=1)
+            self.ln(2)
+            self.set_text_color(60, 60, 60)
+            self.set_font("Helvetica", "", 9)
+            self.set_x(32)
+            self.cell(0, 5, f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=1)
+            self.ln(2)
+            self.line(10, 26, 200, 26)
+            self.ln(6)
+
+        def footer(self):  # noqa: N802
+            self.set_y(-15)
+            self.set_draw_color(*border_rgb)
+            self.line(10, self.get_y(), 200, self.get_y())
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 9)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8, f"Página {self.page_no()}", align="R")
+
+        def section_title(self, text: str, level: int = 2):
+            self.set_text_color(*primary_rgb)
+            if level <= 1:
+                self.set_font("Helvetica", "B", 16)
+                self.ln(2)
+                self.cell(0, 10, text, ln=1)
+            elif level == 2:
+                self.set_font("Helvetica", "B", 13)
+                self.ln(2)
+                self.cell(0, 8, text, ln=1)
+            else:
+                self.set_font("Helvetica", "B", 11)
+                self.ln(1)
+                self.cell(0, 7, text, ln=1)
+            self.set_text_color(40, 40, 40)
+
+        def paragraph(self, text: str):
+            self.set_font("Helvetica", "", 11)
+            self.set_text_color(40, 40, 40)
+            self.multi_cell(0, 6, text)
+
+        def bullet(self, text: str):
+            self.set_font("Helvetica", "", 11)
+            self.set_text_color(40, 40, 40)
+            x0 = self.get_x()
+            self.set_x(x0 + 4)
+            self.multi_cell(0, 6, f"- {text}")
+            self.set_x(x0)
+
+        def hr(self):
+            self.ln(2)
+            self.set_draw_color(*border_rgb)
+            self.line(10, self.get_y(), 200, self.get_y())
+            self.ln(4)
+
+        def callout(self, title_: str, body_: str):
+            # Caixa com fundo leve para blocos importantes
+            self.ln(1)
+            x = 10
+            y = self.get_y()
+            w = 190
+            self.set_fill_color(*bg_rgb)
+            self.set_draw_color(*border_rgb)
+            self.rect(x, y, w, 0.1, style="FD")  # inicia
+            self.set_xy(x + 4, y + 3)
+            self.set_text_color(*primary_rgb)
+            self.set_font("Helvetica", "B", 11)
+            self.multi_cell(w - 8, 6, title_)
+            self.set_text_color(40, 40, 40)
+            self.set_font("Helvetica", "", 11)
+            self.multi_cell(w - 8, 6, body_)
+            y2 = self.get_y()
+            # redesenha a caixa com altura correta
+            self.set_xy(x, y)
+            self.rect(x, y, w, max(10, y2 - y + 2), style="FD")
+            self.set_xy(x + 4, y + 3)
+            self.set_text_color(*primary_rgb)
+            self.set_font("Helvetica", "B", 11)
+            self.multi_cell(w - 8, 6, title_)
+            self.set_text_color(40, 40, 40)
+            self.set_font("Helvetica", "", 11)
+            self.multi_cell(w - 8, 6, body_)
+            self.ln(2)
+
+    pdf = PDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # -----------------------
+    # Capa
+    # -----------------------
+    pdf.add_page()
+    # fundo suave
+    pdf.set_fill_color(*bg_rgb)
+    pdf.rect(0, 0, 210, 297, style="F")
+
+    # logo grande central (se existir)
+    try:
+        if os.path.exists("Logo Clinica Pace (1) (1).png"):
+            pdf.image("Logo Clinica Pace (1) (1).png", x=70, y=55, w=70)
+    except Exception:
+        pass
+
+    pdf.set_text_color(*primary_rgb)
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_y(135)
+    pdf.cell(0, 12, safe_title, align="C", ln=1)
+
+    pdf.set_text_color(60, 60, 60)
+    pdf.set_font("Helvetica", "", 12)
+    pdf.ln(2)
+    pdf.cell(0, 8, "Relatório executivo gerado por IA", align="C", ln=1)
+    pdf.ln(1)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}", align="C", ln=1)
+
+    # -----------------------
+    # Conteúdo
+    # -----------------------
+    pdf.add_page()
+    body = safe_md
+
+    # Extrair “Resumo executivo” (primeiro bloco de texto após o heading correspondente, se existir)
+    resumo = ""
+    m = re.search(r"(?im)^##\\s*RESUMO\\s+EXECUTIVO\\s*$([\\s\\S]*?)(^##\\s+|\\Z)", body)
+    if m:
+        resumo = m.group(1).strip()
+        resumo = re.sub(r"(?im)^---\\s*$", "", resumo).strip()
+
+    if resumo:
+        pdf.callout("Resumo executivo", _markdown_to_safe_text(resumo)[:1200])
+        pdf.hr()
+
+    # Render simples de Markdown (títulos, bullets, separadores, parágrafos)
+    in_code = False
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+
+        s = line.strip()
+        if not s:
+            pdf.ln(2)
+            continue
+
+        if s == "---":
+            pdf.hr()
+            continue
+
+        # headings
+        if s.startswith("#"):
+            level = len(s) - len(s.lstrip("#"))
+            text = s.lstrip("#").strip()
+            pdf.section_title(_markdown_to_safe_text(text), level=level)
+            continue
+
+        # bullets
+        if s.startswith("- "):
+            pdf.bullet(_markdown_to_safe_text(s[2:].strip()))
+            continue
+
+        # default paragraph
+        pdf.paragraph(_markdown_to_safe_text(s))
+
+    return bytes(pdf.output(dest="S"))
 
 # ============================================================================
 # INTERFACE PRINCIPAL
@@ -1182,6 +1492,174 @@ def page_avaliacoes():
         mime="text/csv"
     )
 
+def page_insights():
+    st.title("🤖 Insights para Sócios e Gestores (IA)")
+    st.markdown("---")
+
+    data = load_data()
+    if data is None:
+        st.stop()
+    df = data["atendimentos"]
+
+    # ------------------------------------------------------------------------
+    # Filtros (reaproveitando a lógica existente)
+    # ------------------------------------------------------------------------
+    st.sidebar.header("🔍 Filtros (Insights)")
+
+    data_min = df["data_atendimento"].min().date()
+    data_max = df["data_atendimento"].max().date()
+
+    filtros = {}
+    filtros["data_min"] = st.sidebar.date_input(
+        "Data Inicial",
+        value=data_min,
+        min_value=data_min,
+        max_value=data_max,
+        key="ins_data_min",
+    )
+    filtros["data_max"] = st.sidebar.date_input(
+        "Data Final",
+        value=data_max,
+        min_value=data_min,
+        max_value=data_max,
+        key="ins_data_max",
+    )
+
+    st.sidebar.markdown("---")
+
+    diagnosticos_disponiveis = sorted(df["diagnostico_vigente"].dropna().unique())
+    tem_sem_diag = "SEM DIAGNÓSTICO" in diagnosticos_disponiveis
+    if tem_sem_diag:
+        incluir_sem_diag = st.sidebar.checkbox("Incluir 'SEM DIAGNÓSTICO'", value=True, key="ins_incluir_sem_diag")
+        if not incluir_sem_diag:
+            diagnosticos_disponiveis = [d for d in diagnosticos_disponiveis if d != "SEM DIAGNÓSTICO"]
+
+    filtros["diagnosticos"] = st.sidebar.multiselect(
+        "Diagnóstico",
+        options=diagnosticos_disponiveis,
+        default=diagnosticos_disponiveis,
+        key="ins_diag",
+    )
+
+    st.sidebar.markdown("---")
+
+    unidades_disponiveis = sorted(df["unidade"].dropna().unique())
+    filtros["unidades"] = st.sidebar.multiselect(
+        "Unidade",
+        options=unidades_disponiveis,
+        default=unidades_disponiveis,
+        key="ins_unid",
+    )
+
+    profissionais_disponiveis = sorted(df["profissional_atendimento"].dropna().unique())
+    filtros["profissionais"] = st.sidebar.multiselect(
+        "Profissional do Atendimento",
+        options=profissionais_disponiveis,
+        default=profissionais_disponiveis,
+        key="ins_prof",
+    )
+
+    st.sidebar.markdown("---")
+    filtros["paciente_busca"] = st.sidebar.text_input("Buscar Paciente (ID)", key="ins_paciente")
+    filtros["paciente_exato"] = st.sidebar.checkbox("Busca exata", value=False, key="ins_paciente_exato")
+
+    df_filtrado = apply_filters(df, filtros)
+
+    # ------------------------------------------------------------------------
+    # Prévia do recorte
+    # ------------------------------------------------------------------------
+    col1, col2, col3, col4 = st.columns(4)
+    total_atendimentos = len(df_filtrado)
+    pacientes_unicos = df_filtrado["paciente_id"].nunique() if "paciente_id" in df_filtrado.columns else 0
+    diagnosticos_distintos = df_filtrado["diagnostico_vigente"].nunique() if "diagnostico_vigente" in df_filtrado.columns else 0
+    sem_diag_count = (df_filtrado["diagnostico_vigente"] == "SEM DIAGNÓSTICO").sum() if "diagnostico_vigente" in df_filtrado.columns else 0
+    with col1:
+        st.metric("Atendimentos", f"{total_atendimentos:,}")
+    with col2:
+        st.metric("Pacientes únicos", f"{int(pacientes_unicos):,}")
+    with col3:
+        st.metric("Diagnósticos", f"{int(diagnosticos_distintos):,}")
+    with col4:
+        pct_sem_diag = (sem_diag_count / total_atendimentos * 100) if total_atendimentos > 0 else 0.0
+        st.metric("% sem diagnóstico", f"{pct_sem_diag:.1f}%")
+
+    st.markdown("---")
+
+    st.subheader("Configuração do relatório")
+    periodo_label = st.text_input(
+        "Nome do período (para o relatório)",
+        value=f"{filtros['data_min']} até {filtros['data_max']}",
+        key="ins_periodo_label",
+    )
+    foco = st.text_area(
+        "Foco / perguntas que os gestores querem responder (opcional)",
+        value="",
+        key="ins_foco",
+        height=100,
+        placeholder="Ex.: Quais unidades cresceram mais? Há excesso de 'SEM DIAGNÓSTICO'? Quais diagnósticos estão emergindo?",
+    )
+
+    with st.expander("Configurações da IA", expanded=False):
+        model = st.text_input("Modelo", value="gpt-4o-mini", key="ins_model")
+        temperature = st.slider("Criatividade (temperature)", min_value=0.0, max_value=1.0, value=0.2, step=0.1, key="ins_temp")
+        st.caption("No Streamlit Cloud, configure a chave em `st.secrets[\"OPENAI_API_KEY\"]` (ou env `OPENAI_API_KEY`).")
+
+    prompt_template = _read_text_file("prompt_insights.md")
+    data_context = _build_insights_data_context(df_filtrado, periodo_label=periodo_label)
+    if foco.strip():
+        data_context = f"{data_context}\n\n### Foco solicitado pelos gestores\n{foco.strip()}\n"
+
+    api_key = _get_openai_api_key()
+    gerar = st.button("Gerar relatório com IA", type="primary", disabled=(api_key is None))
+    if api_key is None:
+        st.warning("Para gerar com IA, configure `OPENAI_API_KEY` nas Secrets do Streamlit Cloud ou como variável de ambiente.")
+
+    if gerar:
+        with st.spinner("Gerando relatório com IA..."):
+            try:
+                report_md = _generate_insights_with_ai(
+                    prompt_template=prompt_template,
+                    data_context_md=data_context,
+                    api_key=api_key,
+                    model=model,
+                    temperature=float(temperature),
+                )
+                st.session_state["insights_report_md"] = report_md
+                st.session_state["insights_pdf_bytes"] = _report_md_to_pdf_bytes(
+                    title=f"Relatório de Insights - {periodo_label}",
+                    report_md=report_md,
+                )
+            except Exception as e:
+                st.error(f"Erro ao gerar relatório: {e}")
+
+    report_md = st.session_state.get("insights_report_md")
+    if report_md:
+        st.subheader("Relatório (prévia)")
+        st.markdown(report_md)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.download_button(
+                "📄 Baixar PDF",
+                data=st.session_state.get("insights_pdf_bytes", b""),
+                file_name=f"relatorio_insights_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
+            )
+        with col_b:
+            st.download_button(
+                "📝 Baixar Markdown",
+                data=report_md,
+                file_name=f"relatorio_insights_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+            )
+        with col_c:
+            st.download_button(
+                "🧩 Baixar contexto enviado para IA",
+                data=data_context,
+                file_name=f"contexto_insights_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+            )
+
 def main_app():
     # Logo no topo da sidebar (aparece em todas as páginas)
     display_logo()
@@ -1189,7 +1667,7 @@ def main_app():
     # Menu de navegação
     page = st.sidebar.selectbox(
         "📑 Navegação",
-        ["Dashboard Principal", "Avaliações", "QA - Qualidade"]
+        ["Dashboard Principal", "Avaliações", "QA - Qualidade", "Insights"]
     )
     
     if page == "Dashboard Principal":
@@ -1198,6 +1676,8 @@ def main_app():
         page_avaliacoes()
     elif page == "QA - Qualidade":
         page_qa()
+    elif page == "Insights":
+        page_insights()
 
 if __name__ == "__main__":
     main_app()
